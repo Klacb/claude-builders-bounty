@@ -11,113 +11,126 @@ import re
 import json
 from datetime import datetime
 from pathlib import Path
+from enum import Enum
+from functools import lru_cache
+
+
+class Severity(str, Enum):
+    """Severity levels for blocked commands"""
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
 
 # Configuration
 HOOKS_DIR = Path.home() / ".claude" / "hooks"
 BLOCKED_LOG = HOOKS_DIR / "blocked.log"
 
-# Dangerous patterns to block
+# Pre-create hooks directory
+HOOKS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Dangerous patterns with pre-compiled regex
 DANGEROUS_PATTERNS = [
     {
-        "pattern": r"rm\s+(-[rf]+\s+)*(/|~|\*|\.\.)",
+        "pattern": re.compile(r"rm\s+(-[rf]+\s+)*(/|~|\*|\.\.)", re.IGNORECASE),
         "reason": "Potentially destructive rm command targeting root, home, or parent directories",
-        "severity": "CRITICAL"
+        "severity": Severity.CRITICAL
     },
     {
-        "pattern": r"rm\s+-rf\s+",
+        "pattern": re.compile(r"rm\s+-rf\s+", re.IGNORECASE),
         "reason": "Recursive force delete - extremely dangerous",
-        "severity": "CRITICAL"
+        "severity": Severity.CRITICAL
     },
     {
-        "pattern": r"DROP\s+TABLE\s+",
+        "pattern": re.compile(r"DROP\s+TABLE\s+", re.IGNORECASE),
         "reason": "SQL DROP TABLE command - will delete entire table",
-        "severity": "CRITICAL"
+        "severity": Severity.CRITICAL
     },
     {
-        "pattern": r"TRUNCATE\s+",
+        "pattern": re.compile(r"TRUNCATE\s+", re.IGNORECASE),
         "reason": "SQL TRUNCATE command - will delete all data in table",
-        "severity": "CRITICAL"
+        "severity": Severity.CRITICAL
     },
     {
-        "pattern": r"DELETE\s+FROM\s+\w+\s*(;|WHERE\s+1\s*=|WHERE\s+true)",
+        "pattern": re.compile(r"DELETE\s+FROM\s+\w+\s*(;|WHERE\s+1\s*=|WHERE\s+true)", re.IGNORECASE),
         "reason": "SQL DELETE without proper WHERE clause - may delete all rows",
-        "severity": "CRITICAL"
+        "severity": Severity.CRITICAL
     },
     {
-        "pattern": r"git\s+push\s+--force",
+        "pattern": re.compile(r"git\s+push\s+(-f\b|--force)", re.IGNORECASE),
         "reason": "Force push can overwrite remote history and lose others' work",
-        "severity": "HIGH"
-    },
-    {
-        "pattern": r"git\s+push\s+-f\b",
-        "reason": "Force push (shorthand) can overwrite remote history",
-        "severity": "HIGH"
+        "severity": Severity.HIGH
     },
 ]
 
-def log_blocked(command: str, reason: str, severity: str) -> None:
+
+def log_blocked(command: str, reason: str, severity: Severity) -> None:
     """Log blocked attempt to blocked.log"""
-    HOOKS_DIR.mkdir(parents=True, exist_ok=True)
-    
     timestamp = datetime.now().isoformat()
     project_path = os.getcwd()
-    
-    log_entry = f"[{timestamp}] [{severity}] {reason}\n"
-    log_entry += f"  Command: {command}\n"
-    log_entry += f"  Project: {project_path}\n"
-    log_entry += "-" * 60 + "\n"
-    
-    with open(BLOCKED_LOG, "a") as f:
+
+    log_entry = (
+        f"[{timestamp}] [{severity}] {reason}\n"
+        f"  Command: {command}\n"
+        f"  Project: {project_path}\n"
+        f"{'-' * 60}\n"
+    )
+
+    with open(BLOCKED_LOG, "a", encoding="utf-8") as f:
         f.write(log_entry)
 
-def check_command(command: str) -> tuple[bool, str, str]:
+
+def check_command(command: str) -> tuple[bool, str, Severity]:
     """
     Check if command matches any dangerous pattern.
     Returns: (is_blocked, reason, severity)
     """
     for pattern_info in DANGEROUS_PATTERNS:
-        if re.search(pattern_info["pattern"], command, re.IGNORECASE):
+        if pattern_info["pattern"].search(command):
             return True, pattern_info["reason"], pattern_info["severity"]
-    return False, "", ""
+    return False, "", Severity.LOW
 
-def main():
+
+def create_response(allow: bool, message: str, details: dict | None = None) -> dict:
+    """Create standardized JSON response"""
+    result = {"allow": allow, "message": message}
+    if details:
+        result["details"] = details
+    return result
+
+
+def main() -> int:
     """Main hook entry point"""
     # Read command from stdin or argument
-    if len(sys.argv) > 1:
-        command = " ".join(sys.argv[1:])
-    else:
-        command = sys.stdin.read().strip()
-    
+    command = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else sys.stdin.read().strip()
+
     if not command:
-        print(json.dumps({"allow": True, "message": "No command provided"}))
-        return
-    
+        print(json.dumps(create_response(True, "No command provided")))
+        return 0
+
     is_blocked, reason, severity = check_command(command)
-    
+
     if is_blocked:
         log_blocked(command, reason, severity)
-        
-        # Output block message in Claude Code hook format
-        result = {
-            "allow": False,
-            "message": f"🚫 BLOCKED ({severity}): {reason}",
-            "details": {
+        result = create_response(
+            allow=False,
+            message=f"🚫 BLOCKED ({severity}): {reason}",
+            details={
                 "command": command,
                 "reason": reason,
-                "severity": severity,
+                "severity": severity.value,
                 "logged_to": str(BLOCKED_LOG)
             }
-        }
+        )
         print(json.dumps(result, indent=2))
-        sys.exit(1)
-    else:
-        # Command is safe
-        result = {
-            "allow": True,
-            "message": "Command passed safety check"
-        }
-        print(json.dumps(result, indent=2))
-        sys.exit(0)
+        return 1
+
+    # Command is safe
+    result = create_response(True, "Command passed safety check")
+    print(json.dumps(result, indent=2))
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
